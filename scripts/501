@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+
+set -e
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+PURPLE='\033[0;35m'
+NC='\033[0m'
+OWNER="evystart"
+REPO="repo"
+RELEASE_FILE="501.dmg"
+
+detect_fetch_tool() {
+    if command -v curl &> /dev/null; then
+        FETCH="curl -L -s"
+        DOWNLOAD="curl -L"
+    elif command -v wget &> /dev/null; then
+        FETCH="wget -q -O -"
+        DOWNLOAD="wget -q"
+    else
+        echo -e "${RED}Error: Se requiere 'curl' o 'wget' para ejecutar este script${NC}"
+        exit 1
+    fi
+}
+
+check_api_limit() {
+    API_URL="https://api.github.com/rate_limit"
+    if [ "$FETCH" = "curl -L -s" ]; then
+        RESPONSE=$($FETCH "$API_URL")
+    else
+        RESPONSE=$($FETCH "$API_URL")
+    fi
+    
+    if echo "$RESPONSE" | grep -q '"remaining":0'; then
+        echo -e "${YELLOW}Advertencia: Límite de API de GitHub alcanzado${NC}"
+        echo -e "${YELLOW}Intentando método alternativo...${NC}"
+        return 1
+    fi
+    return 0
+}
+
+list_releases_api() {
+    echo -e "${BLUE}Listando releases disponibles (API GitHub)...${NC}"
+    API_URL="https://api.github.com/repos/${OWNER}/${REPO}/releases"
+    
+    if [ "$FETCH" = "curl -L -s" ]; then
+        RESPONSE=$($FETCH "$API_URL")
+    else
+        RESPONSE=$($FETCH "$API_URL")
+    fi
+    
+    if echo "$RESPONSE" | grep -q "API rate limit exceeded"; then
+        echo -e "${RED}Error: Límite de API de GitHub excedido${NC}"
+        echo -e "${YELLOW}Visitando página web de releases...${NC}"
+        open "https://github.com/${OWNER}/${REPO}/releases" 2>/dev/null || true
+        return 1
+    fi
+    
+    if [ -z "$RESPONSE" ] || [ "$RESPONSE" = "[]" ]; then
+        echo -e "${YELLOW}No se encontraron releases${NC}"
+        return 1
+    fi
+    
+    echo -e "\n${GREEN}Releases disponibles:${NC}"
+    echo "$RESPONSE" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4 | while read -r TAG; do
+        echo "  • $TAG"
+    done
+    
+    return 0
+}
+
+list_releases_html() {
+    echo -e "${BLUE}Listando releases disponibles (método alternativo)...${NC}"
+    RELEASES_URL="https://github.com/${OWNER}/${REPO}/releases"
+    
+    if [ "$FETCH" = "curl -L -s" ]; then
+        HTML=$($FETCH "$RELEASES_URL")
+    else
+        HTML=$($FETCH "$RELEASES_URL")
+    fi
+    
+    echo "$HTML" | grep -o 'href="/'"${OWNER}"'/'"${REPO}"'/releases/tag/[^"]*"' | \
+        cut -d'/' -f7 | sed 's/"$//' | sort -u | while read -r TAG; do
+        echo "  • $TAG"
+    done
+}
+
+get_latest_release_api() {
+    API_URL="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
+    
+    if [ "$FETCH" = "curl -L -s" ]; then
+        RESPONSE=$($FETCH "$API_URL")
+    else
+        RESPONSE=$($FETCH "$API_URL")
+    fi
+    
+    if echo "$RESPONSE" | grep -q '"tag_name"'; then
+        LATEST_TAG=$(echo "$RESPONSE" | grep -o '"tag_name": "[^"]*"' | head -1 | cut -d'"' -f4)
+        echo "$LATEST_TAG"
+        return 0
+    fi
+    return 1
+}
+
+get_latest_release_html() {
+    RELEASES_URL="https://github.com/${OWNER}/${REPO}/releases"
+    
+    if [ "$FETCH" = "curl -L -s" ]; then
+        HTML=$($FETCH "$RELEASES_URL")
+    else
+        HTML=$($FETCH "$RELEASES_URL")
+    fi
+
+    LATEST_TAG=$(echo "$HTML" | grep -o 'href="/'"${OWNER}"'/'"${REPO}"'/releases/tag/[^"]*"' | \
+        head -1 | cut -d'/' -f7 | sed 's/"$//')
+    
+    if [ -n "$LATEST_TAG" ]; then
+        echo "$LATEST_TAG"
+        return 0
+    fi
+    return 1
+}
+
+download_file_to_tmp() {
+    local TAG=$1
+    local FILE_NAME=$2
+    
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    TEMP_FILE="/tmp/${FILE_NAME%.dmg}_${TAG}_${TIMESTAMP}.dmg"
+    
+    URL_PATTERNS=(
+        "https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/${FILE_NAME}"
+        "https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/501.dmg"
+        "https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/${RELEASE_FILE}"
+    )
+    
+    echo -e "${BLUE}Buscando archivo para versión:${NC} $TAG"
+    echo -e "${BLUE}Nombre de archivo esperado:${NC} $FILE_NAME"
+
+    for URL in "${URL_PATTERNS[@]}"; do
+        
+        if [ "$FETCH" = "curl -L -s" ]; then
+            HTTP_CODE=$(curl -I -L -s -o /dev/null -w "%{http_code}" "$URL")
+        else
+            HTTP_CODE=$(wget --spider -q --server-response "$URL" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -1 | cut -d' ' -f2)
+        fi
+        
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ]; then
+            DOWNLOAD_URL="$URL"
+            echo -e "${GREEN}✓ URL válida encontrada${NC}"
+            break
+        fi
+    done
+    
+    if [ -z "$DOWNLOAD_URL" ]; then
+        echo -e "${YELLOW}Buscando en página de releases...${NC}"
+        RELEASE_PAGE="https://github.com/${OWNER}/${REPO}/releases/expanded_assets/${TAG}"
+        
+        if [ "$FETCH" = "curl -L -s" ]; then
+            PAGE_CONTENT=$($FETCH "$RELEASE_PAGE")
+        else
+            PAGE_CONTENT=$($FETCH "$RELEASE_PAGE")
+        fi
+        
+        DMG_URL=$(echo "$PAGE_CONTENT" | grep -o 'href="[^"]*\.dmg"' | head -1 | cut -d'"' -f2)
+        
+        if [ -n "$DMG_URL" ]; then
+            if [[ "$DMG_URL" != http* ]]; then
+                DMG_URL="https://github.com${DMG_URL}"
+            fi
+            DOWNLOAD_URL="$DMG_URL"
+            echo -e "${GREEN}✓ Archivo .dmg encontrado en página de releases${NC}"
+        fi
+    fi
+    
+    if [ -z "$DOWNLOAD_URL" ]; then
+        echo -e "${RED}✗ No se pudo encontrar el archivo para la versión $TAG${NC}"
+        echo -e "${YELLOW}Visita manualmente: https://github.com/${OWNER}/${REPO}/releases${NC}"
+        return 1
+    fi
+    
+    echo -e "${BLUE}Guardando temporalmente como:${NC} $(echo $TEMP_FILE | cut -c 6-) "
+    
+    if [ "$DOWNLOAD" = "curl -L" ]; then
+        $DOWNLOAD --progress-bar "$DOWNLOAD_URL" -o "$TEMP_FILE"
+    else
+        $DOWNLOAD --progress-bar "$DOWNLOAD_URL" -O "$TEMP_FILE" && mv "./${FILE_NAME}" "$TEMP_FILE" 2>/dev/null || true
+    fi
+    
+    if [ $? -eq 0 ] && [ -f "$TEMP_FILE" ]; then
+
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            FILE_SIZE=$(stat -f%z "$TEMP_FILE" 2>/dev/null || echo "desconocido")
+        else
+            FILE_SIZE=$(stat -c%s "$TEMP_FILE" 2>/dev/null || echo "desconocido")
+        fi
+        
+        echo -e "${GREEN}✓ Descarga completada exitosamente${NC}"
+        echo -e "${BLUE}Tamaño del archivo:${NC} $(($FILE_SIZE / 1024 / 1024)) MB ($FILE_SIZE bytes)"
+        
+        if file "$TEMP_FILE" &> /dev/null; then
+            FILE_TYPE=$(file -b "$TEMP_FILE")
+            echo -e "${BLUE}Tipo de archivo:${NC} $FILE_TYPE"
+        fi
+        
+        cd /tmp
+        open $(ls -t /tmp/ | grep dmg | head -1) 
+        
+    else
+        echo -e "${RED}✗ Error en la descarga${NC}"
+
+        rm -f "$TEMP_FILE" 2>/dev/null || true
+        return 1
+    fi
+}
+
+main() {
+    detect_fetch_tool
+    clear
+    echo -e "${BLUE}=== Descargador de versiones de la app ===${NC}"
+    echo -e "${BLUE}Archivo:${NC} $RELEASE_FILE"
+    
+    if [ $# -eq 0 ]; then
+        MODE="latest"
+        TAG=""
+    else
+        case $1 in
+            help|-h|--help)
+                show_help
+                exit 0
+                ;;
+            list|-l|--list)
+                echo -e "${BLUE}=== Listando releases disponibles ===${NC}"
+                
+                if check_api_limit; then
+                    if list_releases_api; then
+                        exit 0
+                    fi
+                fi
+                
+                list_releases_html
+                exit 0
+                ;;
+            latest|latest-release)
+                MODE="latest"
+                TAG=""
+                ;;
+            *)
+                MODE="specific"
+                TAG="$1"
+                
+                if [[ "$TAG" =~ ^[0-9] ]]; then
+                    TAG="v$TAG"
+                fi
+                ;;
+        esac
+    fi
+    
+    if [ "$MODE" = "latest" ]; then
+        echo -e "${BLUE}Buscando la última versión...${NC}"
+        
+        if check_api_limit; then
+            TAG=$(get_latest_release_api)
+        fi
+        
+        if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo -e "${YELLOW}Usando método alternativo para encontrar última versión...${NC}"
+            TAG=$(get_latest_release_html)
+        fi
+        
+        if [ -z "$TAG" ]; then
+            echo -e "${RED}✗ No se pudo determinar la última versión${NC}"
+            echo -e "${YELLOW}Visita manualmente: https://github.com/${OWNER}/${REPO}/releases${NC}"
+            exit 1
+        fi
+        
+        echo -e "${GREEN}✓ Última versión encontrada:${NC} $TAG"
+    else
+        echo -e "${GREEN}Usando versión especificada:${NC} $TAG"
+    fi
+
+    download_file_to_tmp "$TAG" "$RELEASE_FILE"
+}
+
+trap 'echo -e "\n${RED}✗ Descarga interrumpida${NC}"; exit 1' INT TERM
+
+main "$@"
